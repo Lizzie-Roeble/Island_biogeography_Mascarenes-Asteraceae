@@ -1,0 +1,773 @@
+---
+title: 'DAISIEprep: Mascarenes Asteraceae'
+output: html_document
+date: "2025-08-25"
+---
+
+# Overview
+
+## DAISIEprep workflow
+
+Preparing community island data for DAISIE using DAISIEprep (<https://joshwlambert.github.io/DAISIEprep/index.html>) can be broken into 3 major steps:
+
+### 1. Read in data (island checklists and phylogenies) and resolve issues
+
+Starting data needed:
+
+-   Checklist of island community (minimum needed = Species name and endemicity status)
+
+-   Overview of island lineages (optional)
+
+-   Dated phylogenies (if available)
+
+Three sub-steps:
+
+A. Load data
+
+B. Resolve any issues with the dated phylogenies (standardize names, resolve non-monophyly)
+
+C. Combine phylogeny and endemicity status `create_endemicity_status()`
+
+### 2. Build island_tbl for all lineages
+
+Protocol based on data availability.
+
+**Dated phylogeny available:**
+
+-   Reconstruct ASR with `add_asr_node_states()`
+
+-   Extract island species with `extract_island_species()`
+
+-   Add missing species for each lineage with `add_missing_species()`
+
+**Diversity data only or In-text age estimates:**
+
+-   Add all lineage information with `add_island_colonist()`
+
+`add_island_colonist()`
+
+Very important function and full details found here: <https://joshwlambert.github.io/DAISIEprep/reference/add_island_colonist.html?q=add_island_colonist#ref-usage>. This function adds an island colonists (can be either a singleton lineage or an island clade) to the island community (island_tbl).
+
+Missing species is difficult to calculate. General protocol: Number of missing species = Number of species in lineage - Number of colonization and branching times available. Read tutorial carefully for different scenarios: <https://joshwlambert.github.io/DAISIEprep/articles/Tutorial.html#adding-missing-species>
+
+### 3. Create DAISIE data table
+
+Convert `island_tbl` to a DAISIE data list with `create_daisie_data()`
+
+Need to provide and specify the following:
+
+-   `island_tbl` with all the lineages
+
+-   island age
+
+-   number of mainland species
+
+-   precise colonization times
+
+## Mascarenes Asteraceae overview
+
+The Mascarenes Asteraceae are represented by 60 native species, 58 of which are endemic to the archipelago. There are additional 7 species that are possibly native. The native Mascarenes community comprises 15 independent colonization events, and 6 radiations for 2 or more species. When the possibly native species are considered, there are 22 colonization events.
+
+Here is an overview of the Mascarenes Asteraceae lineages with notes on diversity and data available per lineages.
+
+```{r}
+Mascarenes_clades <- readxl::read_xlsx("../../data/Asteraceae_clades_Mascarenes.xlsx")
+head(Mascarenes_clades)
+```
+
+## Libraries
+
+Install DAISIEprep
+
+```{r, eval=F}
+remotes::install.packages("remotes")
+remotes::install_github("joshwlambert/DAISIEprep")
+```
+
+Load libraries
+
+```{r, message=F}
+library(readxl)
+library(writexl)
+library(DAISIEprep)
+library(DAISIE)
+library(ape)
+library(phylobase)
+library(ggtree)
+library(ggimage)
+library(castor)
+library(tidyverse)
+library(phytools)
+library(treeio)
+```
+
+# 1. Read in data (island checklists and phylogenies) and resolve issues
+
+## 1a: Load the data
+
+The island community checklist is a list of all the species native in an island/archipelego. The minimum required elements are the species name and island endemicity status.
+
+```{r}
+checklist <- read_xlsx("../../data/Asteraceae_species_checklist_Mascarenes.xlsx", sheet = "Checklist - full")
+
+checklist <- checklist %>%
+  filter(is.na(Subspecies) | Subspecies == "") %>%
+  filter(Native == "Native" | Native == "Possibly_Native")
+
+```
+
+Note this checklist includes subspecies, but for DAISIE we want to model everything at the species level as to not over-inflate rates. So we will be working at the species level.
+
+For connecting the checklists to the phylogeny later, we will need two column data frame with the species names (`tip_labels`) and formatted at Genus_species in the first column, and a second column with endemicity status (`tip_endemicity_status`) with the status being either "endemic" or "nonendemic"
+
+```{r}
+Mascarenes_endemicity <- checklist %>%
+select(c(Standardized_name, DAISIE_endemicity_status)) %>%
+  rename(tip_labels = Standardized_name, tip_endemicity_status = DAISIE_endemicity_status)
+```
+
+Load the phylogenetic tree.
+
+`Asteraceae-wide_Paragone-MO_ML-dated.tre` = New Asteraceae-wide target capture phylogeny. Orthology resolution with Paragone-MO. Samples added for every tribe from PAFTOL. ML tree dated with RelTime and 10 fossil calibrations.
+
+```{r}
+islandAsteraceae <- ape::read.nexus("../../Phylogenomics/Outputs_phylogenies/Tree_files/Asteraceae-wide_Paragone-MO_ML-dated.tre")
+
+is.rooted(islandAsteraceae) 
+is.binary(islandAsteraceae) 
+```
+
+## 1b: Resolve any issues with the dated phylogenies (standardize names, resolve non-monophyly)
+
+Input phylogenies all have their own tip label naming convention that we need to standardize in order to match our island checklist data and be compatible with DAISIEprep. Additionally, other issues may arise around duplicate samples and non-monophyly.
+
+In our new island Asteraceae phylogenies, for some speices, we sampled multiple individuals of the same species, so need to remove the species duplicates. This is also complicated by the fact that in numerous cases the subspecies or multi-sample species are not monophyletic. There are several strategies to deal with this. One, remove duplicates of monophyletic subspecies/multi-sampled species. For the non-monophyletic subspecies either (a) take the oldest branching time (more congruent with incomplete lineage sorting) (b) select the the autonym subspecies (c) remove subspecies randomly.
+
+Here we will standardize the names and take the oldest branching times for the non-monophyletic species.
+
+### **Standardize the Island Asteraceae Phylogeny**
+
+We need to standardize the names to prepare the phylogeny for DAISIEprep. Where we only want the Genus_species.
+
+Several taxa are notes as -cf meaning "confer" or "compare with". Signifying uncertainity - in the identification, the collection locality (ie looks like Mauritius species but collected on Reunion), etc.
+
+Below are the samples, notes on cf flag and action taken.
+
+| Sample                                            | Monophyletic with named samples?                                                                                                | Notes                                                                                                   | Phylo/DAISIE action |
+|---------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------|---------------------|
+| Psiadia_reticulata-cf_Reunion_L998_MNOPQ          | No. Sister to Psiadia_laurifolia-cf-insignis_Reunion_L928_MNOPQ. But there is a not of uncertainty within the Psiada radiation. | C. Theabuad sample. Notes that this sample is different from P. reticulata samples (TDNA809)            | Drop this tip.      |
+| Psiadia_laurifolia-cf-insignis_Reunion_L928_MNOPQ | No. Psiadia_reticulata-cf_Reunion_L998_MNOPQ, but in a clade with P. insignis and P. laurifolia                                 | Collected by Valente at Cilaos trail to Piton des Neiges Gite. ID uncertain to laurifolia/cf insignis   | Drop this tip.      |
+| Psiadia_salaziana-cf_Reunion_L929_R               | No.                                                                                                                             | Collected by Valente at Cilaos trail to Piton des Neiges Gite. ID uncertain to Psiadia_salaziana-cf     | Drop this tip.      |
+| Psiadia_terebinthina-cf_Reunion_L957_MNOPQ        | Not sister to Mauritius Psiadia_terebinthina (interesting) but does sit with the Mascarenes radiation.                          | Specimen collectected on Reunion that similar to Psiadia terebinthina (Mauritius endemic). Interesting! | Drop this tip.      |
+| Helichrysum_arnicoides-cf_Reunion_L895_R          | Yes, sister to Helichrysum_arnicoides_Reunion_L912_MNOPQ                                                                        |                                                                                                         | Drop this tip.      |
+
+```{r}
+# Psiadia_reticulata-cf_Reunion_L998_MNOPQ
+islandAsteraceae <- ape::drop.tip(islandAsteraceae, "Psiadia_reticulata-cf_Reunion_L998_MNOPQ")
+
+# Psiadia_laurifolia-cf-insignis_Reunion_L928_MNOPQ
+islandAsteraceae <- ape::drop.tip(islandAsteraceae, "Psiadia_laurifolia-cf-insignis_Reunion_L928_MNOPQ")
+
+# Psiadia_salaziana-cf_Reunion_L929_R
+islandAsteraceae <- ape::drop.tip(islandAsteraceae, "Psiadia_salaziana-cf_Reunion_L929_R")
+
+# Psiadia_terebinthina-cf_Reunion_L957_MNOPQ
+islandAsteraceae <- ape::drop.tip(islandAsteraceae, "Psiadia_terebinthina-cf_Reunion_L957_MNOPQ")
+
+# Helichrysum_arnicoides-cf_Reunion_L895_R
+islandAsteraceae <- ape::drop.tip(islandAsteraceae, "Helichrysum_arnicoides-cf_Reunion_L895_R")
+
+```
+
+For all non-endemic species, we need to add the archipelago to the name so we can id the island taxa from the mainland after name standardization.
+
+```{r}
+# Adenostemma_mauritianum
+islandAsteraceae$tip.label <- gsub("Adenostemma_mauritianum_Mauritius_L981_GHIL", "Adenostemma_mauritianum-Mascarenes", islandAsteraceae$tip.label)
+
+# Adenostemma_viscosum
+islandAsteraceae$tip.label <- gsub("Adenostemma_viscosum_Reunion_L1131_GHIL", "Adenostemma_viscosum-Mascarenes", islandAsteraceae$tip.label)
+
+#Cyanthillium_cinereum
+islandAsteraceae$tip.label <- gsub("Cyanthillium_cinereum_Reunion_L991_GHIL", "Cyanthillium_cinereum-Mascarenes", islandAsteraceae$tip.label)
+islandAsteraceae$tip.label <- gsub("Cyanthillium_cinereum_Rodrigues_L992_GHIL", "Cyanthillium_cinereum-Mascarenes", islandAsteraceae$tip.label)
+islandAsteraceae$tip.label <- gsub("Cyanthillium_cinereum_Mauritius_L820_MNOPQ", "Cyanthillium_cinereum-Mascarenes", islandAsteraceae$tip.label)
+
+# Humbertacalia_tomentosa
+islandAsteraceae$tip.label <- gsub("Humbertacalia_tomentosa_Reunion_L913_MNOPQ", "Humbertacalia_tomentosa-Mascarenes", islandAsteraceae$tip.label)
+
+# Launaea_sarmentosa
+islandAsteraceae$tip.label <- gsub("Launaea_sarmentosa_Mauritius_L876_MNOPQ", "Launaea_sarmentosa-Mascarenes", islandAsteraceae$tip.label)
+
+# Pseudognaphalium_luteoalbum
+islandAsteraceae$tip.label <- gsub("Pseudognaphalium_luteoalbum_Mauritius_L990_GHIL", "Pseudognaphalium_luteoalbum-Mascarenes", islandAsteraceae$tip.label)
+islandAsteraceae$tip.label <- gsub("Pseudognaphalium_luteoalbum_Reunion_L1010_GHIL", "Pseudognaphalium_luteoalbum-Mascarenes", islandAsteraceae$tip.label)
+
+```
+
+Fix spelling mistake: Senecio_boutoni (in tree) to Senecio_boutonii
+
+```{r}
+islandAsteraceae$tip.label <- gsub("Senecio_boutoni_Rodrigues_L978_MNOPQ", "Senecio_boutonii_Rodrigues_L978_MNOPQ", islandAsteraceae$tip.label)
+```
+
+Deal with multiple samples per species. Select the tip with the oldest node age for the among the duplicates for each species. The drop the younger tips for each list. Manually review which tip was selected as the oldest.
+
+```{r}
+# Split the tip labels based on "_"
+split_names_islandAsteraceae <- strsplit(x = islandAsteraceae$tip.label, split = "_")
+
+# Remove all the Subfamily and tribe names
+# Function to remove elements ending in "eae"
+remove_eae <- function(name_parts) {
+  name_parts[!grepl("eae$", name_parts)]
+}
+# note: Cyclolepis will not standardize correctly but we can ignore since its an outgroup
+
+# Apply the removal function and combine the remaining parts to get Genus_species
+genus_species_names_islandAsteraceae <- sapply(split_names_islandAsteraceae, function(parts) {
+  cleaned_parts <- remove_eae(parts)
+  paste(cleaned_parts[1], cleaned_parts[2], sep = "_")
+})
+
+# Identify duplicate species
+island_multi_species_islandAsteraceae <- unique(genus_species_names_islandAsteraceae[duplicated(genus_species_names_islandAsteraceae)])
+
+# Get the positions of the duplicates
+duplicate_positions <- lapply(island_multi_species_islandAsteraceae, function(species) {
+  which(genus_species_names_islandAsteraceae == species)
+})
+
+# Function to get the node age for a given tip position
+get_node_age_at_position <- function(tree, position) {
+  # Get the node number corresponding to the tip position directly
+  node_number <- position  
+  # Get the length of the edge connecting to the parent node
+  edge_length <- tree$edge.length[which(tree$edge[, 2] == node_number)]
+  # Return the edge length as the node age (time to the root)
+  return(edge_length)
+}
+
+# Initialize a summary table
+summary_table_oldest_dup_islandAsteraceae <- data.frame(Group = integer(), Oldest_Tip = character(), Oldest_Age = numeric(), stringsAsFactors = FALSE)
+
+# Identify the youngest tips in each group and prepare them for removal
+drop_youngest_subspecies_islandAsteraceae<- unlist(lapply(seq_along(duplicate_positions), function(group_index) {
+  tip_indices <- duplicate_positions[[group_index]]
+  # Get node ages for all tips in the current group
+  node_ages <- sapply(tip_indices, function(pos) {
+    get_node_age_at_position(islandAsteraceae, pos)
+  })
+  # Find the index of the oldest tip (to keep)
+  oldest_tip_index <- which.max(node_ages)
+  # Add the oldest tip and its age to the summary table
+summary_table_oldest_dup_islandAsteraceae <<- rbind(
+    summary_table_oldest_dup_islandAsteraceae,
+    data.frame(
+      Group = group_index,
+      Oldest_Tip = islandAsteraceae$tip.label[tip_indices[oldest_tip_index]],
+      Oldest_Age = node_ages[oldest_tip_index],
+      stringsAsFactors = FALSE
+    )
+  )
+  # Return all other tips (youngest) for removal
+  tip_indices[-oldest_tip_index]
+}))
+
+# Drop the youngest tips 
+islandAsteraceae <- ape::drop.tip(
+  phy = islandAsteraceae,
+  tip = drop_youngest_subspecies_islandAsteraceae  # pass indices directly
+)
+
+# Print the summary table for manual review
+print(summary_table_oldest_dup_islandAsteraceae)
+```
+
+Update the tip labels to the standardized name, so we can match the tree to the checklist
+
+```{r}
+# After dropping tips, standardize the names directly from the current tip labels
+split_names_islandAsteraceae <- strsplit(x = islandAsteraceae$tip.label, split = "_")
+
+# same function as above 
+remove_eae <- function(name_parts) {
+  name_parts[!grepl("eae$", name_parts)]
+}
+
+# Apply the standardization directly to the current tip labels
+standardized_names <- sapply(split_names_islandAsteraceae, function(parts) {
+  cleaned_parts <- remove_eae(parts)
+  paste(cleaned_parts[1], cleaned_parts[2], sep = "_")
+})
+
+# Directly update the tree's tip labels
+islandAsteraceae$tip.label <- standardized_names
+
+```
+
+## 1c Combine phylogeny and endemicity status create_endemicity_status()
+
+Convert the trees to phylo4 objects
+
+```{r}
+islandAsteraceae <- phylobase::phylo4(islandAsteraceae)
+```
+
+Create endemicity status data frame.
+
+create_endemicity_status() creates a data frame with the endemicity status (either 'endemic', 'nonendemic', 'not_present') of every species in the phylogeny using a phylogeny and a data frame of the island species and their endemicity (either 'endemic' or 'nonendemic') provided.
+
+```{r}
+endemicity_status_islandAsteraceae <- DAISIEprep::create_endemicity_status(
+  phylo = islandAsteraceae,
+  island_species = Mascarenes_endemicity
+)
+```
+
+Combine tree and endemicity status
+
+```{r}
+islandAsteraceae_phylod <- phylobase::phylo4d(
+  islandAsteraceae,
+  endemicity_status_islandAsteraceae
+)
+```
+
+Visually check the trees
+
+```{r}
+plot_phylod(phylod = islandAsteraceae_phylod)
+```
+
+# 2. Build island_tbl for all lineages
+
+## Lineages with dated phylogenies
+
+**A. Reconstruct ASR with `add_asr_node_states()`**
+
+Reconstruct geographic ancestral states for extraction with asr
+
+```{r}
+islandAsteraceae_phylod <- DAISIEprep::add_asr_node_states(
+  phylod = islandAsteraceae_phylod,
+  asr_method = "mk",
+  tie_preference = "mainland"
+)
+```
+
+**B. Extract island community and adding missing species**
+
+Start building the `island_tbl`: (1) extract the island community with `extract_island_species()` and (2) Add any missing species with `add_missing_species()` for each lineage
+
+Extract the island community. Assign missing species. Update the clade names.
+
+```{r}
+# extract island community using asr algorithm
+island_tbl <- DAISIEprep::extract_island_species(
+  phylod = islandAsteraceae_phylod,
+  extraction_method = "asr"
+)
+```
+
+Add missing species to each lineage. Both Psiadia lineages are missing 1 species each
+
+```{r}
+# assign missing species to Psiadia_Reunion colonists
+island_tbl <- DAISIEprep::add_missing_species(
+  island_tbl = island_tbl,
+  num_missing_species = 1,
+  species_to_add_to = "Psiadia_insignis"
+)
+
+# assign missing species to Psiadia_Mascarenes colonists
+island_tbl <- DAISIEprep::add_missing_species(
+  island_tbl = island_tbl,
+  num_missing_species = 1,
+  species_to_add_to = "Psiadia_penninervia"
+)
+```
+
+Rename the lineages
+
+```{r}
+# manually set clade name Cylindrocline-Monarrhenus
+clade_column <- island_tbl@island_tbl$clade_name
+index_to_replace <- which(clade_column == "Cylindrocline_lorencei")
+clade_column[index_to_replace] <- "Cylindrocline-Monarrhenus"
+island_tbl@island_tbl$clade_name <- clade_column
+
+# manually set clade name Helichrysum_Mascarenes
+clade_column <- island_tbl@island_tbl$clade_name
+index_to_replace <- which(clade_column == "Helichrysum_proteoides")
+clade_column[index_to_replace] <- "Helichrysum_Mascarenes"
+island_tbl@island_tbl$clade_name <- clade_column
+
+# manually set clade name Psiadia_Reunion
+clade_column <- island_tbl@island_tbl$clade_name
+index_to_replace <- which(clade_column == "Psiadia_insignis")
+clade_column[index_to_replace] <- "Psiadia_Reunion"
+island_tbl@island_tbl$clade_name <- clade_column
+
+# manually set clade name Psiadia_Mascarenes
+clade_column <- island_tbl@island_tbl$clade_name
+index_to_replace <- which(clade_column == "Psiadia_penninervia")
+clade_column[index_to_replace] <- "Psiadia_Mascarenes"
+island_tbl@island_tbl$clade_name <- clade_column
+
+# manually set clade name Faujasia_alliance
+clade_column <- island_tbl@island_tbl$clade_name
+index_to_replace <- which(clade_column == "Parafaujasia_fontinalis")
+clade_column[index_to_replace] <- "Faujasia_alliance"
+island_tbl@island_tbl$clade_name <- clade_column
+
+# manually set clade name Hubertia_Mascarenes
+clade_column <- island_tbl@island_tbl$clade_name
+index_to_replace <- which(clade_column == "Hubertia_ambavilla")
+clade_column[index_to_replace] <- "Hubertia_Mascarenes"
+island_tbl@island_tbl$clade_name <- clade_column
+
+# manually set clade name Humbertacalia_tomentosa
+clade_column <- island_tbl@island_tbl$clade_name
+index_to_replace <- which(clade_column == "Humbertacalia_tomentosa-Mascarenes")
+clade_column[index_to_replace] <- "Humbertacalia_tomentosa"
+island_tbl@island_tbl$clade_name <- clade_column
+
+# manually set clade name Adenostemma_mauritianum
+clade_column <- island_tbl@island_tbl$clade_name
+index_to_replace <- which(clade_column == "Adenostemma_mauritianum-Mascarenes")
+clade_column[index_to_replace] <- "Adenostemma_mauritianum"
+island_tbl@island_tbl$clade_name <- clade_column
+
+# manually set clade name Adenostemma_viscosum
+clade_column <- island_tbl@island_tbl$clade_name
+index_to_replace <- which(clade_column == "Adenostemma_viscosum-Mascarenes")
+clade_column[index_to_replace] <- "Adenostemma_viscosum"
+island_tbl@island_tbl$clade_name <- clade_column
+
+# manually set clade name Pseudognaphalium_luteoalbum
+clade_column <- island_tbl@island_tbl$clade_name
+index_to_replace <- which(clade_column == "Pseudognaphalium_luteoalbum-Mascarenes")
+clade_column[index_to_replace] <- "Pseudognaphalium_luteoalbum"
+island_tbl@island_tbl$clade_name <- clade_column
+
+# manually set clade name Cyanthillium_cinereum
+clade_column <- island_tbl@island_tbl$clade_name
+index_to_replace <- which(clade_column == "Cyanthillium_cinereum-Mascarenes")
+clade_column[index_to_replace] <- "Cyanthillium_cinereum"
+island_tbl@island_tbl$clade_name <- clade_column
+
+# manually set clade name Launaea_sarmentosa
+clade_column <- island_tbl@island_tbl$clade_name
+index_to_replace <- which(clade_column == "Launaea_sarmentosa-Mascarenes")
+clade_column[index_to_replace] <- "Launaea_sarmentosa"
+island_tbl@island_tbl$clade_name <- clade_column
+
+# Clades with standard name (no change needed):
+# Stoebe_passerinoides
+# Senecio_boutonii
+# Senecio_ptarmicifolius
+# Hubertia_multifoliosa
+# Gymnanthemum_fimbrilliferum
+# Distephanus_populifolius
+
+```
+
+Plot the colonization times.
+
+Note: here only using the lineages with colonization time estimate. The lineage with diversity data only (added below) are not present in this figure. Export to add these manually and improve the aesthetics.
+
+```{r}
+colonization_plot <- plot_colonisation(island_tbl, island_age = 8.9)
+```
+
+```{r}
+ggsave("../outputs/Mascarenes_Asteraceae_colonization_plot_raw_v2.pdf", width = 6 , height = 5, units = "in")
+```
+
+## Lineages with in-text age estimates or diversity data only
+
+Manually add lineages that have only in-text age estimates or diversity data only with `add_island_colonist()`. See notes on counting missing species carefully: <https://joshwlambert.github.io/DAISIEprep/articles/Tutorial.html#adding-missing-species>
+
+-   `missing_species` In the case of a lineage with just 1 species (i.e. not an island radiation) the number of missing species is zero, as by adding the colonist it already counts as one automatically. In the case of an island clade of more than one species, the number of missing species in this case should be `n-1`.
+
+When this colonist later gets processed by the DAISIE inference model it will be assumed it colonised the island any time between the island's formation and the present.
+
+Rhamphogyne rhynchocarpa:
+
+Number of species: 1, endemic
+
+```{r}
+# add Rhamphogyne_rhynchocarpa
+island_tbl <- add_island_colonist(
+  island_tbl = island_tbl,
+  clade_name = "Rhamphogyne_rhynchocarpa",
+  status = "endemic",
+  # clade with just 1 species, missing_species = 0
+  # because adding the lineage already counts as 1
+  missing_species = 0,
+  col_time = NA_real_,
+  col_max_age = FALSE,
+  branching_times = NA_real_,
+  min_age = NA_real_,
+  clade_type = 1,
+  species = "Rhamphogyne_rhynchocarpa"
+)
+```
+
+Emilia lyrata:
+
+Number of species: 1, endemic, also possibly native, extinct
+
+```{r}
+# add Emilia_lyrata
+island_tbl <- add_island_colonist(
+  island_tbl = island_tbl,
+  clade_name = "Emilia_lyrata",
+  status = "endemic",
+  # clade with just 1 species, missing_species = 0
+  # because adding the lineage already counts as 1
+  missing_species = 0,
+  col_time = NA_real_,
+  col_max_age = FALSE,
+  branching_times = NA_real_,
+  min_age = NA_real_,
+  clade_type = 1,
+  species = "Emilia_lyrata"
+)
+```
+
+Blumea axillaris:
+
+Number of species: 1, nonendemic, possibly native
+
+```{r}
+# add Emilia_lyrata
+island_tbl <- add_island_colonist(
+  island_tbl = island_tbl,
+  clade_name = "Blumea_axillaris",
+  status = "nonendemic",
+  # clade with just 1 species, missing_species = 0
+  # because adding the lineage already counts as 1
+  missing_species = 0,
+  col_time = NA_real_,
+  col_max_age = FALSE,
+  branching_times = NA_real_,
+  min_age = NA_real_,
+  clade_type = 1,
+  species = "Blumea_axillaris"
+)
+```
+
+## Save the island lineage table
+
+We want two versions of the dataset: (a) Native species only (ie no "possibly native") and (b) Including the possibly native.
+
+Possibly native lineages/species:
+
+1.  Adenostemma_mauritianum
+
+2.  Adenostemma_viscosum
+
+3.  Pseudognaphalium_luteoalbum
+
+4.  Cyanthillium_cinereum
+
+5.  Emilia_lyrata
+
+6.  Blumea_axillaris
+
+```{r}
+poss_native <- c(
+  "Adenostemma_mauritianum",
+  "Adenostemma_viscosum",
+  "Pseudognaphalium_luteoalbum",
+  "Cyanthillium_cinereum",
+  "Emilia_lyrata",
+  "Blumea_axillaris"
+)
+
+island_tbl_native <- island_tbl
+
+for (cl in poss_native) {
+  island_tbl_native <- rm_island_colonist(island_tbl_native, clade_name = cl)
+}
+
+```
+
+Rename to specify. Current `island_tbl` includes the possibly native speices
+
+```{r}
+island_tbl_nativeposs <- island_tbl
+```
+
+Save the island tables.
+
+```{r}
+# convert list-columns to character
+island_tbl_native_clean <- island_tbl_native@island_tbl %>%
+  mutate(across(where(is.list), ~ sapply(., function(x) paste(x, collapse = ","))))
+# save
+write_xlsx(island_tbl_native_clean, "../data/Mascarenes_DAISIE_lineages_native.xlsx")
+```
+
+```{r}
+# convert list-columns to character
+island_tbl_nativeposs_clean <- island_tbl_nativeposs@island_tbl %>%
+  mutate(across(where(is.list), ~ sapply(., function(x) paste(x, collapse = ","))))
+# save
+write_xlsx(island_tbl_nativeposs_clean, "../data/Mascarenes_DAISIE_lineages_nativeposs.xlsx")
+```
+
+# 3. Create DAISIE data table
+
+Convert `island_tbl` to a DAISIE data list - input data of the DAISIE inference model - with `create_daisie_data()`. Need to provide and specify the following:
+
+-   `island_tbl` with all the lineages
+
+-   precise colonization times: whether the colonisation times extracted from the phylogenetic data should be considered precise or max ages
+
+-   island age
+
+-   number of mainland species
+
+Set island age to 8.9 Mya (Moore 2011)
+
+Set mainland pool to 4,000 species (WCVP; number of native Asteraceae to East Africa, South Africa, Madagascar)
+
+```{r}
+island_age <- 8.9
+num_mainland_species <- 4000
+```
+
+Convert to daisie data list.
+
+Natives
+
+```{r}
+Mascarenes_DAISIE_datalist_native <- DAISIEprep::create_daisie_data(
+  data = island_tbl_native,
+  island_age = island_age,
+  num_mainland_species = num_mainland_species, 
+  num_clade_types = 1,
+  list_type2_clades = NA,
+  epss = 1e-05,
+  precise_col_time = TRUE 
+)
+```
+
+Natives + possibly native
+
+```{r}
+Mascarenes_DAISIE_datalist_nativeposs <- DAISIEprep::create_daisie_data(
+  data = island_tbl_nativeposs,
+  island_age = island_age,
+  num_mainland_species = num_mainland_species, 
+  num_clade_types = 1,
+  list_type2_clades = NA,
+  epss = 1e-05,
+  precise_col_time = TRUE 
+)
+```
+
+Save the DAISIE datalists
+
+```{r}
+save(Mascarenes_DAISIE_datalist_native, file = "../data/Mascarenes_DAISIE_datalist_native.Rdata")
+save(Mascarenes_DAISIE_datalist_nativeposs, file = "../data/Mascarenes_DAISIE_datalist_nativeposs.Rdata")
+```
+
+# 4. DAISIE model (preliminary)
+
+Visualize the data
+
+```{r}
+DAISIE_plot_island(Mascarenes_DAISIE_datalist_native)
+```
+
+## Basic DAISIE model overview
+
+To fit a DAISIE model we need to specify the following functions:
+
+-   `datalist` - The name of the DAISIE datalist (Hawaii_DAISIE_data_list)
+
+-   `initparsopt` - these are the initial values from the parameters for which the likelihood will be optimised. Its recommended to try a variety of initial starting parameters to ensure the optimum is found. In DAISIE the parameters have the following position:
+
+    1.  Rate of cladogenesis (per species on the island per time unit)
+    2.  Rate of extinction (per species on the island per time unit)
+    3.  Carrying-capacity (K') - maximum number of species any clade can reach on the island for CS models; maximum number of species on the island across all clades for IW models.
+    4.  Rate of colonisation (per species on the mainland per time unit)
+    5.  Rate of anagenesis (per species on the island per time unit)
+
+-   `idparsopt` - The position of the parameters to optimise (e.g. to optimize cladogenesis and anagenesis only c(1,5).
+
+-   `parsfix` - If parameters are being fixed, specify here the value (e.g. if fixing K' to Inf and fixing anagenesis to 0 - c(Inf,0).
+
+-   `idparsfix` - The position of the paratemers fixed (e.g. to fix K' and anagenesis c(3,5)).
+
+-   `ddmodel` - Set 0 for diversity-independent models; 11 for diversity-dependent models (IW and CS) where cladogenesis and colonisation decline linearly with diversity. There are other options.
+
+## Native lineages
+
+**Diversity dependence model (DD): Clade-specific diversity-dependent model**
+
+n2s: test differ init values, esp for K
+
+```{r}
+Natives_DD_25 <- DAISIE::DAISIE_ML(
+  datalist = Mascarenes_DAISIE_datalist_native,
+  initparsopt = c(1, 1, 25, 0.1, 1),
+  idparsopt = 1:5,
+  parsfix = NULL,
+  idparsfix = NULL,
+  # ddmodel = 11: linear diversity-dependence in speciation and immigration rate
+  ddmodel = 11,
+  jitter = 1e-5
+)
+Natives_DD_25
+```
+
+```{r}
+Natives_DD_sims <- DAISIE_sim(
+  time = 7.8,
+  M = 4000,
+  # rates from model (Natives_DD) output
+  pars = c(x, x, x, x, x),
+  divdepmodel = "CS",
+  replicates= 100,
+  plot_sims = TRUE
+)
+DAISIE_plot_sims(Natives_DD_sims)
+```
+
+**Diversity-independent model (DI): Clade-specific diversity-independent model**
+
+```{r}
+Natives_DI <- DAISIE_ML(
+  datalist = Hawaii_DAISIE_datalist,
+  initparsopt = c(x, x, x, x, x),
+  idparsopt = c(1,2,4,5),
+  ddmodel = 0,
+  parsfix = Inf,
+  idparsfix = 3,
+  jitter = 1e-5
+)
+Natives_DI
+```
+
+loglik = -X; df = 4
+
+```{r}
+Natives_DI_sims <- DAISIE_sim(
+  time = 7.8,
+  M = 4000,
+  # rates from model (Natives_DI) output
+  pars = c(x, x, x, x, x),
+  replicates= 100,
+  plot_sims = TRUE
+)
+
+DAISIE_plot_sims(Natives_DI)
+```
+
+## Native + possibly native lineages
