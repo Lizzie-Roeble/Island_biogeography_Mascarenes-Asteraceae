@@ -1,0 +1,133 @@
+---
+title: 'HybSeq Recovery: Fresh vs Herbarium'
+output: html_document
+date: "2025-10-17"
+---
+
+Goal: Explore and plot hybpiper recovery for field and herbarium samples.
+
+Load pacakges:
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readxl)
+library(writexl)
+library(patchwork)
+```
+
+Load data. Hybpiper recovery stats. All three datasets are on different sheets.
+
+```{r}
+path <- "/Users/lizzieroeble/Library/Mobile Documents/com~apple~CloudDocs/Documents/PhD_Naturalis/ChX_Hawaiian_Mascarenes_Asteraceae/Phylogenomics/data/Hybiper_summary_stats.xlsx"
+
+summary_stats <- read_xlsx(path , sheet = "Island+mainland")
+```
+
+Make sure the NAs are real then filter those out.
+
+```{r}
+summary_stats[summary_stats == "NA"] <- NA
+
+summary_stats_clean <- summary_stats %>% drop_na("Material", "Collection year") 
+```
+
+Summary by material
+
+```{r}
+material_summary <- summary_stats_clean %>%
+  group_by(Material) %>%
+  summarize(
+    n = n(),
+    mean_loci = round(mean(GenesAt75pct, na.rm = TRUE)),
+    median_loci = round(median(GenesAt75pct, na.rm = TRUE)),
+    sd_loci = round(sd(GenesAt75pct, na.rm = TRUE)),
+    samples_over100 = sum(GenesAt75pct > 100, na.rm = TRUE),
+    pct_over100 = round(mean(GenesAt75pct > 100, na.rm = TRUE) * 100),
+    samples_over300 = sum(GenesAt75pct > 300, na.rm = TRUE),
+    pct_over300 = round(mean(GenesAt75pct > 300, na.rm = TRUE) * 100)
+  )
+
+print(material_summary)
+```
+
+Save summary table.
+
+```{r}
+write_xlsx(material_summary, "../Phylogenomics/Reports_Review/hybpiper_recovery_herbarium-v-field_summarytable.xlsx")
+```
+
+Box plot
+
+```{r}
+# Define colors for each Material type
+point_colors <- c(
+  "Herbarium" = "#f4a259",
+  "Fresh" = "#8cb369"
+)
+
+boxplot <- ggplot(summary_stats_clean, aes(x = Material, y = GenesAt75pct)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = Material), width = 0.15, alpha = 0.7, size = 2) +
+  scale_color_manual(values = point_colors) +
+  stat_summary(fun = length, geom = "text",
+               aes(label = paste0("n=", ..y..)),
+               vjust = -28,
+               family = "Gill Sans") +
+  labs(x = "", 
+       y = "Genes at 75% target length",
+       title = "A. Recovery by sample material") +
+  theme_classic(base_family = "Gill Sans") +
+  theme(legend.position = "none") 
+
+print(boxplot)
+```
+
+Scatterplot by age
+
+```{r}
+summary_stats_clean$`Collection year` <- as.numeric(summary_stats_clean$`Collection year`)
+
+age_plot <- ggplot(summary_stats_clean, aes(x = `Collection year`, y = GenesAt75pct, color = Material)) +
+  geom_jitter(width = 1, height = 1, alpha = 0.7, size = 2) +
+  scale_color_manual(values = point_colors) +
+  scale_x_continuous(breaks = seq(
+    floor(min(summary_stats_clean$`Collection year`, na.rm = TRUE)/25)*25,
+    ceiling(max(summary_stats_clean$`Collection year`, na.rm = TRUE)/25)*25,
+    by = 25
+  )) +
+  labs(x = "Collection Year",
+       y = "Genes at 75% target length",
+       title = "B. Recovery by age") +
+  theme_classic(base_family = "Gill Sans") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+print(age_plot)
+```
+
+```{r}
+combined_plot_vert <- boxplot / age_plot  
+combined_plot_horiz <- boxplot + age_plot  
+```
+
+Save the plot
+
+```{r}
+ggsave(
+  filename = "../Phylogenomics/Reports_Review/Hybpiper_recovery_herbarium-vs-field_plots-vert.png",
+  plot = combined_plot_vert,
+  width = 4,
+  height = 6,
+  units = "in"
+)
+
+ggsave(
+  filename = "../Phylogenomics/Reports_Review/Hybpiper_recovery_herbarium-vs-field_plots-horiz.png",
+  plot = combined_plot_horiz,
+  width = 7,
+  height = 4,
+  units = "in"
+)
+```
